@@ -144,7 +144,7 @@ impl Relays {
     /// - changed endpoints are stopped and started again, if that fails, the old one is restored.
     /// - new endpoints, and those exited, are started.
     pub async fn apply(&mut self, endpoints: Vec<(EndpointConf, EndpointInfo)>) -> std::result::Result<(), String> {
-        let wanted = wanted(endpoints)?;
+        let mut wanted = wanted(endpoints)?;
         let running: HashSet<Key> = self
             .0
             .iter()
@@ -160,7 +160,7 @@ impl Relays {
             }
         }
 
-        // stop relays that are removed, changed or have exited
+        // stop relays that are removed, changed or have exited, start changed ones again
         let stale: Vec<Key> = self
             .0
             .iter()
@@ -169,48 +169,40 @@ impl Relays {
             })
             .map(|(key, _)| *key)
             .collect();
-        let mut changed = HashMap::new();
         for key in stale {
             let relay = self.0.remove(&key).unwrap();
             let old = (relay.conf.clone(), relay.endpoint.clone());
             relay.stop().await;
-            if running.contains(&key) {
-                report(Level::Info, format_args!("stopped: [{}]{}", key.1, key.0));
-                if wanted.contains_key(&key) {
-                    changed.insert(key, old);
-                }
-            }
-        }
-
-        // start new and changed relays
-        for (key, (conf, endpoint)) in wanted {
-            if self.0.contains_key(&key) {
+            // an exited relay is started below with a new listener
+            if !running.contains(&key) {
                 continue;
             }
-            // a changed relay is bound now, after the old listener is closed
-            let bound = match fresh.remove(&key) {
-                Some(lis) => Ok(lis),
-                None => Listener::bind(key.1, &endpoint),
+            report(Level::Info, format_args!("stopped: [{}]{}", key.1, key.0));
+            let Some((conf, endpoint)) = wanted.get(&key) else {
+                continue;
             };
-            let (conf, endpoint, lis) = match bound {
-                Ok(lis) => (conf, endpoint, lis),
-                Err(e) => match changed.remove(&key) {
-                    Some((conf, endpoint)) => {
-                        report(Level::Error, format_args!("{}, restore the old one", e));
-                        match Listener::bind(key.1, &endpoint) {
-                            Ok(lis) => (conf, endpoint, lis),
-                            Err(e) => {
-                                report(Level::Error, format_args!("{}", e));
-                                continue;
-                            }
+
+            // start a changed relay right after it is stopped, so the port is closed only briefly
+            let (conf, endpoint, lis) = match Listener::bind(key.1, endpoint) {
+                Ok(lis) => (conf.clone(), endpoint.clone(), lis),
+                Err(e) => {
+                    report(Level::Error, format_args!("{}, restore the old one", e));
+                    match Listener::bind(key.1, &old.1) {
+                        Ok(lis) => (old.0, old.1, lis),
+                        Err(e) => {
+                            report(Level::Error, format_args!("{}", e));
+                            continue;
                         }
                     }
-                    None => {
-                        report(Level::Error, format_args!("{}", e));
-                        continue;
-                    }
-                },
+                }
             };
+            report(Level::Info, format_args!("started: [{}]{}", key.1, endpoint));
+            self.0.insert(key, Relay::spawn(lis, conf, endpoint));
+        }
+
+        // start new relays, and those exited
+        for (key, lis) in fresh {
+            let (conf, endpoint) = wanted.remove(&key).unwrap();
             report(Level::Info, format_args!("started: [{}]{}", key.1, endpoint));
             self.0.insert(key, Relay::spawn(lis, conf, endpoint));
         }
