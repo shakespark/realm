@@ -55,7 +55,7 @@ pub struct ConnectOpts {
     pub balancer: Balancer,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct BindOpts {
     pub ipv6_only: bool,
     pub accept_mptcp: bool,

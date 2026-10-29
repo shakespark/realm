@@ -14,31 +14,54 @@ mod proxy;
 mod transport;
 
 use std::io::{ErrorKind, Result};
+use std::sync::Arc;
 
-use crate::trick::Ref;
+use tokio::net::TcpListener;
+use tokio::sync::watch;
+
 use crate::endpoint::Endpoint;
 
 use middle::connect_and_relay;
 
 /// Launch a tcp relay.
 pub async fn run_tcp(endpoint: Endpoint) -> Result<()> {
-    let Endpoint {
-        laddr,
-        raddr,
-        bind_opts,
-        conn_opts,
-        extra_raddrs,
-    } = endpoint;
+    let lis = bind_tcp(&endpoint).unwrap_or_else(|e| panic!("[tcp]failed to bind {}: {}", endpoint.laddr, e));
 
-    let raddr = Ref::new(&raddr);
-    let conn_opts = Ref::new(&conn_opts);
-    let extra_raddrs = Ref::new(&extra_raddrs);
+    // keep the sender alive, so that the relay never stops
+    let (_tx, rx) = watch::channel(Arc::new(endpoint));
+    run_tcp_with(lis, rx).await
+}
 
-    let lis = socket::bind(&laddr, bind_opts).unwrap_or_else(|e| panic!("[tcp]failed to bind {}: {}", laddr, e));
-    let keepalive = socket::keepalive::build(&conn_opts);
+/// Bind a tcp listener on the local address of an endpoint.
+pub fn bind_tcp(endpoint: &Endpoint) -> Result<TcpListener> {
+    socket::bind(&endpoint.laddr, endpoint.bind_opts.clone())
+}
+
+/// Launch a tcp relay on a bound listener, whose endpoint can be updated at runtime.
+///
+/// New connections always use the latest endpoint, while established connections keep the old one.
+/// Local address and bind options of an updated endpoint are ignored.
+///
+/// The relay stops accepting new connections once the sender is dropped.
+pub async fn run_tcp_with(lis: TcpListener, mut endpoint: watch::Receiver<Arc<Endpoint>>) -> Result<()> {
+    let mut ep = endpoint.borrow_and_update().clone();
+    let mut keepalive = socket::keepalive::build(&ep.conn_opts);
 
     loop {
-        let (local, addr) = match lis.accept().await {
+        let accepted = tokio::select! {
+            biased;
+            res = endpoint.changed() => {
+                if res.is_err() {
+                    break;
+                }
+                ep = endpoint.borrow_and_update().clone();
+                keepalive = socket::keepalive::build(&ep.conn_opts);
+                continue;
+            }
+            res = lis.accept() => res,
+        };
+
+        let (local, addr) = match accepted {
             Ok(x) => x,
             Err(e) if e.kind() == ErrorKind::ConnectionAborted => {
                 log::warn!("[tcp]failed to accept: {}", e);
@@ -55,13 +78,16 @@ pub async fn run_tcp(endpoint: Endpoint) -> Result<()> {
         // set tcp_keepalive
         if let Some(kpa) = &keepalive {
             use socket::keepalive::SockRef;
-            SockRef::from(&local).set_tcp_keepalive(kpa)?;
+            if let Err(e) = SockRef::from(&local).set_tcp_keepalive(kpa) {
+                log::warn!("[tcp]{} failed to set keepalive: {}", addr, e);
+            }
         }
 
+        let ep = ep.clone();
         tokio::spawn(async move {
-            match connect_and_relay(local, raddr, conn_opts, extra_raddrs).await {
-                Ok(..) => log::debug!("[tcp]{} => {}, finish", addr, raddr.as_ref()),
-                Err(e) => log::error!("[tcp]{} => {}, error: {}", addr, raddr.as_ref(), e),
+            match connect_and_relay(local, &ep).await {
+                Ok(..) => log::debug!("[tcp]{} => {}, finish", addr, ep.raddr),
+                Err(e) => log::error!("[tcp]{} => {}, error: {}", addr, ep.raddr, e),
             }
         });
     }

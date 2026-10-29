@@ -2,14 +2,15 @@ use std::io::Result;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
+use tokio::sync::watch;
+use tokio::task::JoinSet;
 
 use super::SockMap;
 use super::{socket, batched};
 
-use crate::trick::Ref;
 use crate::time::timeoutfut;
 use crate::dns::resolve_addr;
-use crate::endpoint::{RemoteAddr, ConnectOpts};
+use crate::endpoint::Endpoint;
 
 use batched::{Packet, SockAddrStore};
 use registry::Registry;
@@ -106,27 +107,52 @@ mod registry {
     }
 }
 
+/// Relay until the sender of endpoint is dropped.
 pub async fn associate_and_relay(
-    lis: Ref<UdpSocket>,
-    rname: Ref<RemoteAddr>,
-    conn_opts: Ref<ConnectOpts>,
-    sockmap: Ref<SockMap>,
+    lis: &Arc<UdpSocket>,
+    endpoint: &mut watch::Receiver<Arc<Endpoint>>,
+    sockmap: &Arc<SockMap>,
+    associations: &mut JoinSet<()>,
 ) -> Result<()> {
     let mut registry = Registry::new(batched::MAX_PACKETS);
 
     loop {
-        registry.batched_recv_on(&lis).await?;
+        tokio::select! {
+            biased;
+            res = endpoint.changed() => match res {
+                Ok(()) => continue,
+                Err(_) => return Ok(()),
+            },
+            res = registry.batched_recv_on(lis) => res?,
+        }
         log::debug!("[udp]entry batched recvfrom[{}]", registry.count());
-        let raddr = resolve_addr(&rname).await?.iter().next().unwrap();
-        log::debug!("[udp]{} resolved as {}", *rname, raddr);
+
+        // clean up closed associations
+        while associations.try_join_next().is_some() {}
+
+        let ep = endpoint.borrow().clone();
+        let Endpoint {
+            raddr: rname,
+            conn_opts,
+            ..
+        } = ep.as_ref();
+
+        let raddr = resolve_addr(rname).await?.iter().next().unwrap();
+        log::debug!("[udp]{} resolved as {}", rname, raddr);
 
         registry.group_by_addr();
         for pkts in registry.group_iter() {
             let laddr = pkts[0].addr.clone().into();
             let rsock = sockmap.find_or_insert(&laddr, || {
-                let s = Arc::new(socket::associate(&raddr, &conn_opts)?);
-                tokio::spawn(send_back(lis, laddr, s.clone(), conn_opts, sockmap));
-                log::info!("[udp]new association {} => {} as {}", laddr, *rname, raddr);
+                let s = Arc::new(socket::associate(&raddr, conn_opts)?);
+                associations.spawn(send_back(
+                    lis.clone(),
+                    laddr,
+                    s.clone(),
+                    conn_opts.associate_timeout,
+                    sockmap.clone(),
+                ));
+                log::info!("[udp]new association {} => {} as {}", laddr, rname, raddr);
                 Result::Ok(s)
             })?;
             let raddr: SockAddrStore = raddr.into();
@@ -136,14 +162,13 @@ pub async fn associate_and_relay(
 }
 
 async fn send_back(
-    lsock: Ref<UdpSocket>,
+    lsock: Arc<UdpSocket>,
     laddr: SocketAddr,
     rsock: Arc<UdpSocket>,
-    conn_opts: Ref<ConnectOpts>,
-    sockmap: Ref<SockMap>,
+    timeout: usize,
+    sockmap: Arc<SockMap>,
 ) {
     let mut registry = Registry::new(batched::MAX_PACKETS);
-    let timeout = conn_opts.associate_timeout;
     let laddr_s: SockAddrStore = laddr.into();
 
     loop {

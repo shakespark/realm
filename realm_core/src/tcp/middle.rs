@@ -13,15 +13,16 @@ use super::proxy;
 #[cfg(feature = "transport")]
 use super::transport;
 
-use crate::trick::Ref;
-use crate::endpoint::{RemoteAddr, ConnectOpts};
+use crate::endpoint::{Endpoint, ConnectOpts};
 #[allow(unused)]
-pub async fn connect_and_relay(
-    mut local: TcpStream,
-    raddr: Ref<RemoteAddr>,
-    conn_opts: Ref<ConnectOpts>,
-    extra_raddrs: Ref<Vec<RemoteAddr>>,
-) -> Result<()> {
+pub async fn connect_and_relay(mut local: TcpStream, endpoint: &Endpoint) -> Result<()> {
+    let Endpoint {
+        raddr,
+        conn_opts,
+        extra_raddrs,
+        ..
+    } = endpoint;
+
     let ConnectOpts {
         #[cfg(feature = "proxy")]
         proxy_opts,
@@ -34,7 +35,7 @@ pub async fn connect_and_relay(
 
         tcp_keepalive,
         ..
-    } = conn_opts.as_ref();
+    } = conn_opts;
 
     // before connect:
     // - pre-connect hook
@@ -46,13 +47,13 @@ pub async fn connect_and_relay(
             // accept or deny connection.
             #[cfg(feature = "balance")]
             {
-                hook::pre_connect_hook(&mut local, raddr.as_ref(), extra_raddrs.as_ref()).await?;
+                hook::pre_connect_hook(&mut local, raddr, extra_raddrs).await?;
             }
 
             // accept or deny connection, or select a remote peer.
             #[cfg(not(feature = "balance"))]
             {
-                hook::pre_connect_hook(&mut local, raddr.as_ref(), extra_raddrs.as_ref()).await?
+                hook::pre_connect_hook(&mut local, raddr, extra_raddrs).await?
             }
         }
 
@@ -64,17 +65,17 @@ pub async fn connect_and_relay(
             });
             log::debug!("[tcp]select remote peer, token: {:?}", token);
             match token {
-                None | Some(Token(0)) => raddr.as_ref(),
-                Some(Token(idx)) => &extra_raddrs.as_ref()[idx as usize - 1],
+                None | Some(Token(0)) => raddr,
+                Some(Token(idx)) => &extra_raddrs[idx as usize - 1],
             }
         }
 
         #[cfg(not(any(feature = "hook", feature = "balance")))]
-        raddr.as_ref()
+        raddr
     };
 
     // connect!
-    let mut remote = socket::connect(raddr, conn_opts.as_ref()).await?;
+    let mut remote = socket::connect(raddr, conn_opts).await?;
     log::info!("[tcp]{} => {} as {}", local.peer_addr()?, raddr, remote.peer_addr()?);
 
     // after connected

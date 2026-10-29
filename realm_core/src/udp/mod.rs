@@ -6,8 +6,12 @@ mod middle;
 mod batched;
 
 use std::io::Result;
+use std::sync::Arc;
 
-use crate::trick::Ref;
+use tokio::net::UdpSocket;
+use tokio::sync::watch;
+use tokio::task::JoinSet;
+
 use crate::endpoint::Endpoint;
 
 use sockmap::SockMap;
@@ -15,25 +19,37 @@ use middle::associate_and_relay;
 
 /// Launch a udp relay.
 pub async fn run_udp(endpoint: Endpoint) -> Result<()> {
-    let Endpoint {
-        laddr,
-        raddr,
-        bind_opts,
-        conn_opts,
-        ..
-    } = endpoint;
+    let lis = bind_udp(&endpoint).unwrap_or_else(|e| panic!("[udp]failed to bind {}: {}", endpoint.laddr, e));
 
-    let sockmap = SockMap::new();
+    // keep the sender alive, so that the relay never stops
+    let (_tx, rx) = watch::channel(Arc::new(endpoint));
+    run_udp_with(lis, rx).await
+}
 
-    let lis = socket::bind(&laddr, bind_opts).unwrap_or_else(|e| panic!("[udp]failed to bind {}: {}", laddr, e));
+/// Bind a udp socket on the local address of an endpoint.
+pub fn bind_udp(endpoint: &Endpoint) -> Result<UdpSocket> {
+    socket::bind(&endpoint.laddr, endpoint.bind_opts.clone())
+}
 
-    let lis = Ref::new(&lis);
-    let raddr = Ref::new(&raddr);
-    let conn_opts = Ref::new(&conn_opts);
-    let sockmap = Ref::new(&sockmap);
+/// Launch a udp relay on a bound socket, whose endpoint can be updated at runtime.
+///
+/// New associations always use the latest endpoint, while established associations keep the old one.
+/// Local address and bind options of an updated endpoint are ignored.
+///
+/// The relay stops once the sender is dropped, all associations are closed as well.
+pub async fn run_udp_with(lis: UdpSocket, mut endpoint: watch::Receiver<Arc<Endpoint>>) -> Result<()> {
+    let lis = Arc::new(lis);
+    let sockmap = Arc::new(SockMap::new());
+    let mut associations = JoinSet::new();
+
     loop {
-        if let Err(e) = associate_and_relay(lis, raddr, conn_opts, sockmap).await {
-            log::error!("[udp]error: {}", e);
+        match associate_and_relay(&lis, &mut endpoint, &sockmap, &mut associations).await {
+            Ok(()) => break,
+            Err(e) => log::error!("[udp]error: {}", e),
         }
     }
+
+    // release the socket
+    associations.shutdown().await;
+    Ok(())
 }
