@@ -155,3 +155,129 @@ impl Relays {
         join_all(self.0.values_mut().map(|relay| &mut relay.task)).await;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::time::timeout;
+    use crate::conf::{Config, FullConf};
+
+    fn endpoints(conf: &str) -> Vec<(EndpointConf, EndpointInfo)> {
+        let mut conf = FullConf::from_conf_str(conf).unwrap();
+        conf.apply_global_opts();
+        conf.endpoints.into_iter().map(|c| (c.clone(), c.build())).collect()
+    }
+
+    fn task_id(relays: &Relays, laddr: &str, proto: Proto) -> Option<tokio::task::Id> {
+        relays.0.get(&(laddr.parse().unwrap(), proto)).map(|r| r.task.id())
+    }
+
+    // connect through the relay, return the remote that accepts it
+    async fn route(laddr: &str, remotes: &[&TcpListener]) -> usize {
+        let _local = TcpStream::connect(laddr).await.unwrap();
+        let accepts = remotes.iter().map(|r| Box::pin(r.accept()));
+        let (res, idx, _) = timeout(Duration::from_secs(3), futures::future::select_all(accepts))
+            .await
+            .unwrap();
+        res.unwrap();
+        idx
+    }
+
+    #[tokio::test]
+    async fn update_rebind_and_stop() {
+        let laddr = "127.0.0.1:17000";
+        let r0 = TcpListener::bind("127.0.0.1:27000").await.unwrap();
+        let r1 = TcpListener::bind("127.0.0.1:27001").await.unwrap();
+        let mut relays = Relays::default();
+
+        let conf = |remote: &str, extra: &str| {
+            format!(
+                "[[endpoints]]\nlisten = \"{}\"\nremote = \"{}\"\n{}",
+                laddr, remote, extra
+            )
+        };
+
+        relays.apply(endpoints(&conf("127.0.0.1:27000", ""))).await.unwrap();
+        let id = task_id(&relays, laddr, Proto::Tcp).unwrap();
+        assert_eq!(route(laddr, &[&r0, &r1]).await, 0);
+
+        // same config, nothing changes
+        relays.apply(endpoints(&conf("127.0.0.1:27000", ""))).await.unwrap();
+        assert_eq!(task_id(&relays, laddr, Proto::Tcp), Some(id));
+
+        // remote changes, updated in place
+        relays.apply(endpoints(&conf("127.0.0.1:27001", ""))).await.unwrap();
+        assert_eq!(task_id(&relays, laddr, Proto::Tcp), Some(id));
+        assert_eq!(route(laddr, &[&r0, &r1]).await, 1);
+
+        // bind options change, rebind
+        let ipv6_only = "network = { ipv6_only = true }";
+        relays
+            .apply(endpoints(&conf("127.0.0.1:27001", ipv6_only)))
+            .await
+            .unwrap();
+        let id2 = task_id(&relays, laddr, Proto::Tcp).unwrap();
+        assert_ne!(id2, id);
+        assert_eq!(route(laddr, &[&r0, &r1]).await, 1);
+
+        // udp enabled, tcp kept
+        let udp = "network = { ipv6_only = true, use_udp = true }";
+        relays.apply(endpoints(&conf("127.0.0.1:27001", udp))).await.unwrap();
+        assert!(task_id(&relays, laddr, Proto::Udp).is_some());
+        assert_eq!(task_id(&relays, laddr, Proto::Tcp), Some(id2));
+
+        // removed, port released
+        relays.apply(Vec::new()).await.unwrap();
+        assert!(relays.0.is_empty());
+        TcpListener::bind(laddr).await.unwrap();
+        tokio::net::UdpSocket::bind(laddr).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_endpoints() {
+        let mut relays = Relays::default();
+        let one = "[[endpoints]]\nlisten = \"127.0.0.1:17010\"\nremote = \"127.0.0.1:27010\"\n";
+        relays.apply(endpoints(one)).await.unwrap();
+        let id = task_id(&relays, "127.0.0.1:17010", Proto::Tcp);
+
+        // duplicated listen address, nothing changes
+        let dup = format!(
+            "{0}{0}[[endpoints]]\nlisten = \"127.0.0.1:17011\"\nremote = \"127.0.0.1:27010\"\n",
+            one
+        );
+        assert!(relays.apply(endpoints(&dup)).await.is_err());
+        assert_eq!(relays.0.len(), 1);
+        assert_eq!(task_id(&relays, "127.0.0.1:17010", Proto::Tcp), id);
+
+        // a port in use does not block others
+        let _occupied = std::net::TcpListener::bind("127.0.0.1:17012").unwrap();
+        let busy = format!("{}[[endpoints]]\nlisten = \"127.0.0.1:17012\"\nremote = \"127.0.0.1:27010\"\n[[endpoints]]\nlisten = \"127.0.0.1:17013\"\nremote = \"127.0.0.1:27010\"\n", one);
+        relays.apply(endpoints(&busy)).await.unwrap();
+        assert_eq!(task_id(&relays, "127.0.0.1:17010", Proto::Tcp), id);
+        assert!(task_id(&relays, "127.0.0.1:17012", Proto::Tcp).is_none());
+        assert!(task_id(&relays, "127.0.0.1:17013", Proto::Tcp).is_some());
+    }
+
+    #[tokio::test]
+    async fn restart_exited() {
+        let laddr = "127.0.0.1:17020";
+        let remote = TcpListener::bind("127.0.0.1:27020").await.unwrap();
+        let conf = format!("[[endpoints]]\nlisten = \"{}\"\nremote = \"127.0.0.1:27020\"\n", laddr);
+        let mut relays = Relays::default();
+        relays.apply(endpoints(&conf)).await.unwrap();
+
+        // the relay exits on its own, e.g. a fatal accept error
+        let key = (laddr.parse().unwrap(), Proto::Tcp);
+        let relay = relays.0.get_mut(&key).unwrap();
+        relay.task.abort();
+        while !relay.task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+
+        relays.apply(endpoints(&conf)).await.unwrap();
+        assert!(!relays.0[&key].task.is_finished());
+        assert_eq!(route(laddr, &[&remote]).await, 0);
+    }
+}
