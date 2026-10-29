@@ -3,7 +3,6 @@ use cfg_if::cfg_if;
 
 use realm::cmd;
 use realm::conf::{Config, FullConf, LogConf, DnsConf, EndpointConf, EndpointInfo, CmdOverride};
-use realm::relay::Relays;
 use realm::ENV_CONFIG;
 
 cfg_if! {
@@ -52,9 +51,9 @@ fn main() {
                 conf.add_endpoint(ep).apply_global_opts().apply_cmd_opts(opts);
                 (conf, None)
             }
-            CmdInput::Config(path, opts) => {
+            CmdInput::Config(path, opts, reload) => {
                 let source = ConfSource { path, opts };
-                (source.load(), Some(source))
+                (source.load(), reload.then_some(source))
             }
             CmdInput::None => std::process::exit(0),
         }
@@ -76,6 +75,7 @@ fn start_from_conf(full: FullConf, source: Option<ConfSource>) {
     setup_transport();
 
     let endpoints = build_endpoints(endpoints_conf);
+    endpoints.iter().for_each(|(_, x)| println!("inited: {}", x.endpoint));
 
     execute(endpoints, source.map(|source| (source, log_conf, dns_conf)));
 }
@@ -143,37 +143,87 @@ fn execute(eps: Vec<(EndpointConf, EndpointInfo)>, reload: Option<Reload>) {
 }
 
 async fn run(endpoints: Vec<(EndpointConf, EndpointInfo)>, reload: Option<Reload>) {
-    let mut relays = Relays::default();
-    relays.apply(endpoints).await.unwrap_or_else(|e| panic!("{}", e));
+    use realm::core::tcp::run_tcp;
+    use realm::core::udp::run_udp;
+    use futures::future::join_all;
 
     #[cfg(unix)]
     if let Some(reload) = reload {
-        return reload_on_signal(relays, reload).await;
+        return run_reloadable(endpoints, reload).await;
     }
 
     #[cfg(not(unix))]
-    let _ = reload;
+    if reload.is_some() {
+        eprintln!("--reload is not supported on this platform, ignored");
+    }
 
-    relays.join().await;
+    let mut workers = Vec::with_capacity(2 * endpoints.len());
+
+    for (
+        _,
+        EndpointInfo {
+            endpoint,
+            no_tcp,
+            use_udp,
+        },
+    ) in endpoints
+    {
+        if use_udp {
+            workers.push(tokio::spawn(run_udp(endpoint.clone())));
+        }
+
+        if !no_tcp {
+            workers.push(tokio::spawn(run_tcp(endpoint)));
+        }
+    }
+
+    workers.shrink_to_fit();
+
+    join_all(workers).await;
 }
 
-/// Reload config file on SIGHUP.
+/// Run relays, reload config file on SIGHUP.
 #[cfg(unix)]
-async fn reload_on_signal(mut relays: Relays, reload: Reload) {
+async fn run_reloadable(endpoints: Vec<(EndpointConf, EndpointInfo)>, reload: Reload) {
+    use std::process::exit;
     use log::Level;
     use tokio::signal::unix::{signal, SignalKind};
-    use realm::relay::report;
+    use realm::relay::{Relays, report};
     use realm::consts::DEFAULT_LOG_FILE;
 
-    let (source, mut log_conf, dns_conf) = reload;
+    // listen before relays start, the default action of SIGHUP is to terminate
     let mut hup = signal(SignalKind::hangup()).unwrap_or_else(|e| panic!("failed to listen to SIGHUP: {}", e));
 
-    while hup.recv().await.is_some() {
+    let mut relays = Relays::default();
+    if let Err(e) = relays.start(endpoints) {
+        eprintln!("{}", e);
+        exit(1);
+    }
+    if relays.is_empty() {
+        eprintln!("no endpoint is running");
+        exit(1);
+    }
+
+    let (source, mut log_conf, dns_conf) = reload;
+    quiet_panic::install();
+
+    loop {
+        tokio::select! {
+            res = hup.recv() => if res.is_none() {
+                break;
+            },
+            _ = relays.join(), if !relays.is_empty() => {
+                report(Level::Error, format_args!("all endpoints exited"));
+                exit(1);
+            }
+        }
+
         report(Level::Info, format_args!("reload: {}", source.path));
 
         // config errors are panics, which are caught here instead of killing the process
         let src = source.clone();
         let loaded = tokio::task::spawn_blocking(move || {
+            let _quiet = quiet_panic::Guard::new();
             let FullConf {
                 log, dns, endpoints, ..
             } = src.load();
@@ -184,15 +234,10 @@ async fn reload_on_signal(mut relays: Relays, reload: Reload) {
         let (new_log, new_dns, endpoints) = match loaded {
             Ok(x) => x,
             Err(e) => {
-                let reason = match e.try_into_panic() {
-                    Ok(p) => p
-                        .downcast_ref::<String>()
-                        .cloned()
-                        .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
-                        .unwrap_or_default(),
-                    Err(e) => e.to_string(),
-                };
-                report(Level::Error, format_args!("reload failed, keep running: {}", reason));
+                report(
+                    Level::Error,
+                    format_args!("reload failed, keep running: {}", quiet_panic::reason(e)),
+                );
                 continue;
             }
         };
@@ -217,5 +262,52 @@ async fn reload_on_signal(mut relays: Relays, reload: Reload) {
         }
 
         report(Level::Info, format_args!("reload: done"));
+    }
+}
+
+/// Silence the panic message of loading config, which is reported as an error instead.
+#[cfg(unix)]
+mod quiet_panic {
+    use std::cell::Cell;
+    use tokio::task::JoinError;
+
+    thread_local! {
+        static QUIET: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub fn install() {
+        let default = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if !QUIET.with(Cell::get) {
+                default(info)
+            }
+        }));
+    }
+
+    /// Panics on this thread are quiet while the guard is alive.
+    pub struct Guard;
+
+    impl Guard {
+        pub fn new() -> Self {
+            QUIET.with(|x| x.set(true));
+            Guard
+        }
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            QUIET.with(|x| x.set(false));
+        }
+    }
+
+    pub fn reason(e: JoinError) -> String {
+        match e.try_into_panic() {
+            Ok(p) => p
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| p.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default(),
+            Err(e) => e.to_string(),
+        }
     }
 }

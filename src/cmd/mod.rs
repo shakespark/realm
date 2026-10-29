@@ -15,7 +15,7 @@ mod flag;
 
 #[allow(clippy::large_enum_variant)]
 pub enum CmdInput {
-    Config(String, CmdOverride),
+    Config(String, CmdOverride, bool),
     Endpoint(EndpointConf, CmdOverride),
     None,
 }
@@ -115,8 +115,14 @@ fn handle_matches(matches: ArgMatches) -> CmdInput {
 
     let opts = parse_global_opts(&matches);
 
+    let reload = matches.get_flag("reload");
+
     if let Some(config) = matches.get_one("config").cloned() {
-        return CmdInput::Config(config, opts);
+        return CmdInput::Config(config, opts, reload);
+    }
+
+    if reload {
+        eprintln!("--reload requires a config file, ignored");
     }
 
     if matches.contains_id("local") && matches.contains_id("remote") {
