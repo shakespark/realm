@@ -96,6 +96,14 @@ async fn udp_reload() {
         .unwrap();
     assert_eq!(&buf[..n], b"pong");
 
+    // established association keeps the old remote
+    client1.send_to(b"ping2", laddr).await.unwrap();
+    let (n, _) = timeout(Duration::from_secs(3), remote1.recv_from(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&buf[..n], b"ping2");
+
     // stop, socket and associations are released
     drop(tx);
     timeout(Duration::from_secs(3), relay).await.unwrap().unwrap().unwrap();

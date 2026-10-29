@@ -137,24 +137,36 @@ pub async fn associate_and_relay(
             ..
         } = ep.as_ref();
 
-        let raddr = resolve_addr(rname).await?.iter().next().unwrap();
-        log::debug!("[udp]{} resolved as {}", rname, raddr);
+        // an association keeps its remote address, resolve only for new associations
+        let mut resolved = None;
 
         registry.group_by_addr();
         for pkts in registry.group_iter() {
             let laddr = pkts[0].addr.clone().into();
-            let rsock = sockmap.find_or_insert(&laddr, || {
-                let s = Arc::new(socket::associate(&raddr, conn_opts)?);
-                associations.spawn(send_back(
-                    lis.clone(),
-                    laddr,
-                    s.clone(),
-                    conn_opts.associate_timeout,
-                    sockmap.clone(),
-                ));
-                log::info!("[udp]new association {} => {} as {}", laddr, rname, raddr);
-                Result::Ok(s)
-            })?;
+            let (rsock, raddr) = match sockmap.find(&laddr) {
+                Some(x) => x,
+                None => {
+                    let raddr = match resolved {
+                        Some(x) => x,
+                        None => {
+                            let x = resolve_addr(rname).await?.iter().next().unwrap();
+                            log::debug!("[udp]{} resolved as {}", rname, x);
+                            *resolved.insert(x)
+                        }
+                    };
+                    let s = Arc::new(socket::associate(&raddr, conn_opts)?);
+                    sockmap.insert(laddr, s.clone(), raddr);
+                    associations.spawn(send_back(
+                        lis.clone(),
+                        laddr,
+                        s.clone(),
+                        conn_opts.associate_timeout,
+                        sockmap.clone(),
+                    ));
+                    log::info!("[udp]new association {} => {} as {}", laddr, rname, raddr);
+                    (s, raddr)
+                }
+            };
             let raddr: SockAddrStore = raddr.into();
             batched::send_all(&rsock, pkts.iter().map(|x| x.ref_with_addr(&raddr))).await?;
         }

@@ -200,8 +200,8 @@ Reload config file without restart (unix only):
 kill -HUP $(pidof realm)
 ```
 
-- New endpoints are started, removed endpoints are stopped.
-- Changes of an endpoint apply to new connections, established tcp connections are kept. The listener is reused, unless `listen_interface`, `ipv6_only` or `accept_mptcp` changes.
+- New endpoints are started, removed endpoints are stopped. Established tcp connections are kept, udp associations are closed.
+- Changes of an endpoint apply to new connections, established tcp connections and udp associations keep the old config. The listener is reused, unless `listen_interface`, `ipv6_only` or `accept_mptcp` changes.
 - `log.level` is applied, `log.output` and `dns` need a restart.
 - If the config is invalid, nothing is changed and an error is reported.
 
