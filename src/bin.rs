@@ -212,7 +212,8 @@ async fn run_reloadable(endpoints: Vec<(EndpointConf, EndpointInfo)>, reload: Re
             res = hup.recv() => if res.is_none() {
                 break;
             },
-            _ = relays.join(), if !relays.is_empty() => {
+            // also when no endpoint is left after a reload
+            _ = relays.join() => {
                 report(Level::Error, format_args!("all endpoints exited"));
                 exit(1);
             }

@@ -78,7 +78,7 @@ impl Relay {
     async fn stop(self) {
         let Relay { shutdown, task, .. } = self;
         drop(shutdown);
-        // the handle of a finished task may have been polled to completion by `Relays::join`
+        // a finished handle may have been polled to completion by `Relays::join`
         if !task.is_finished() {
             let _ = task.await;
         }
@@ -224,7 +224,9 @@ impl Relays {
 
     /// Wait until all relays exit.
     pub async fn join(&mut self) {
-        join_all(self.0.values_mut().map(|relay| &mut relay.task)).await;
+        // a finished handle may have been polled to completion by an interrupted join, never poll it again
+        let running = self.0.values_mut().filter(|relay| !relay.task.is_finished());
+        join_all(running.map(|relay| &mut relay.task)).await;
     }
 }
 
@@ -360,6 +362,34 @@ mod tests {
         let relay = &relays.0[&(laddr.parse().unwrap(), Proto::Tcp)];
         assert_eq!(relay.conf.listen_interface, None);
         assert_eq!(route(laddr, &[&remote]).await, 0);
+    }
+
+    #[tokio::test]
+    async fn join_after_exited() {
+        let conf = "[[endpoints]]\nlisten = \"127.0.0.1:17040\"\nremote = \"127.0.0.1:27040\"\n[[endpoints]]\nlisten = \"127.0.0.1:17041\"\nremote = \"127.0.0.1:27040\"\n";
+        let mut relays = Relays::default();
+        relays.start(endpoints(conf)).unwrap();
+
+        // one relay exits, join is interrupted (e.g. by a reload that fails), then joined again
+        relays
+            .0
+            .get(&("127.0.0.1:17040".parse().unwrap(), Proto::Tcp))
+            .unwrap()
+            .task
+            .abort();
+        for _ in 0..2 {
+            assert!(timeout(Duration::from_millis(100), relays.join()).await.is_err());
+        }
+
+        // all relays exit
+        relays
+            .0
+            .get(&("127.0.0.1:17041".parse().unwrap(), Proto::Tcp))
+            .unwrap()
+            .task
+            .abort();
+        timeout(Duration::from_secs(1), relays.join()).await.unwrap();
+        timeout(Duration::from_secs(1), relays.join()).await.unwrap();
     }
 
     #[tokio::test]

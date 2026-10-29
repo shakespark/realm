@@ -209,7 +209,8 @@ kill -HUP $(pidof realm)
 - Stopping an endpoint closes its listener and udp associations, established tcp connections are kept.
 - `log.level` is applied, `log.output` and `dns` need a restart.
 - If the config is invalid or a new listener fails to bind, nothing is changed and an error is reported. If a changed endpoint fails to start, the old one is restored.
-- Like without `--reload`, realm exits when all endpoints exit.
+- Like without `--reload`, realm exits when all endpoints exit, with exit code 1.
+- `--reload` only works with `-c`, not with `REALM_CONF`.
 
 Start with environment variables:
 
