@@ -4,7 +4,7 @@ use log::LevelFilter;
 use super::Config;
 use crate::consts::DEFAULT_LOG_FILE;
 
-#[derive(Debug, Default, Serialize, Deserialize, Clone, Copy)]
+#[derive(Debug, Default, Serialize, Deserialize, Clone, Copy, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum LogLevel {
     #[default]
@@ -60,7 +60,7 @@ impl Display for LogLevel {
     }
 }
 
-#[derive(Default, Debug, Serialize, Deserialize, Clone)]
+#[derive(Default, Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct LogConf {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]

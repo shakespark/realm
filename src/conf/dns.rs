@@ -9,7 +9,7 @@ use config::{ResolverConfig, ResolverOpts};
 use super::Config;
 
 // dns mode
-#[derive(Debug, Default, Serialize, Deserialize, Clone, Copy)]
+#[derive(Debug, Default, Serialize, Deserialize, Clone, Copy, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum DnsMode {
     Ipv4Only,
@@ -105,7 +105,7 @@ impl From<DnsProtocol> for Vec<ProtocolConfig> {
 }
 
 // dns config
-#[derive(Debug, Default, Serialize, Deserialize, Clone)]
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
 pub struct DnsConf {
     // ResolverOpts
     #[serde(default)]

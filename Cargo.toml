@@ -34,7 +34,7 @@ futures = "0.3"
 walkdir = "2"
 
 # runtime
-tokio = { version = "1", features = ["rt"] }
+tokio = { version = "1", features = ["rt", "sync", "signal"] }
 
 # logger
 log = "0.4"

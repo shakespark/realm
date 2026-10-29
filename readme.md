@@ -194,6 +194,17 @@ realm -c config.json
 realm -c config/
 ```
 
+Reload config file without restart (unix only):
+
+```shell
+kill -HUP $(pidof realm)
+```
+
+- New endpoints are started, removed endpoints are stopped.
+- Changes of an endpoint apply to new connections, established tcp connections are kept. The listener is reused, unless `listen_interface`, `ipv6_only` or `accept_mptcp` changes.
+- `log.level` is applied, `log.output` and `dns` need a restart.
+- If the config is invalid, nothing is changed and an error is reported.
+
 Start with environment variables:
 
 ```shell
