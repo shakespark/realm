@@ -2,7 +2,6 @@ use std::io::Result;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
-use tokio::sync::watch;
 use tokio::task::JoinSet;
 
 use super::SockMap;
@@ -10,7 +9,7 @@ use super::{socket, batched};
 
 use crate::time::timeoutfut;
 use crate::dns::resolve_addr;
-use crate::endpoint::Endpoint;
+use crate::endpoint::{RemoteAddr, ConnectOpts};
 
 use batched::{Packet, SockAddrStore};
 use registry::Registry;
@@ -109,7 +108,8 @@ mod registry {
 
 pub async fn associate_and_relay(
     lis: &Arc<UdpSocket>,
-    endpoint: &watch::Receiver<Arc<Endpoint>>,
+    rname: &RemoteAddr,
+    conn_opts: &ConnectOpts,
     sockmap: &Arc<SockMap>,
     associations: &mut JoinSet<()>,
 ) -> Result<()> {
@@ -122,32 +122,24 @@ pub async fn associate_and_relay(
             Some(_) = associations.join_next(), if !associations.is_empty() => continue,
         }
         log::debug!("[udp]entry batched recvfrom[{}]", registry.count());
-
-        let ep = endpoint.borrow().clone();
-        let raddr = resolve_addr(&ep.raddr).await?.iter().next().unwrap();
-        log::debug!("[udp]{} resolved as {}", ep.raddr, raddr);
+        let raddr = resolve_addr(rname).await?.iter().next().unwrap();
+        log::debug!("[udp]{} resolved as {}", rname, raddr);
 
         registry.group_by_addr();
         for pkts in registry.group_iter() {
             let laddr = pkts[0].addr.clone().into();
-            let (rsock, assoc_ep) = sockmap.find_or_insert(&laddr, || {
-                let s = Arc::new(socket::associate(&raddr, &ep.conn_opts)?);
+            let rsock = sockmap.find_or_insert(&laddr, || {
+                let s = Arc::new(socket::associate(&raddr, conn_opts)?);
                 associations.spawn(send_back(
                     lis.clone(),
                     laddr,
                     s.clone(),
-                    ep.conn_opts.associate_timeout,
+                    conn_opts.associate_timeout,
                     sockmap.clone(),
                 ));
-                log::info!("[udp]new association {} => {} as {}", laddr, ep.raddr, raddr);
-                Result::Ok((s, ep.clone()))
+                log::info!("[udp]new association {} => {} as {}", laddr, rname, raddr);
+                Result::Ok(s)
             })?;
-            // an association established before the endpoint is updated keeps the old remote
-            let raddr = if Arc::ptr_eq(&assoc_ep, &ep) {
-                raddr
-            } else {
-                resolve_addr(&assoc_ep.raddr).await?.iter().next().unwrap()
-            };
             let raddr: SockAddrStore = raddr.into();
             batched::send_all(&rsock, pkts.iter().map(|x| x.ref_with_addr(&raddr))).await?;
         }

@@ -1,20 +1,19 @@
-//! Running relays, which can be updated without restart.
+//! Running relays, which can be changed without restart.
 
 use std::io::Result;
 use std::fmt::{Display, Formatter};
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use log::Level;
 use tokio::net::{TcpListener, UdpSocket};
-use tokio::sync::watch;
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use futures::future::join_all;
 
 use realm_core::endpoint::Endpoint;
-use realm_core::tcp::{bind_tcp, run_tcp_with};
-use realm_core::udp::{bind_udp, run_udp_with};
+use realm_core::tcp::{bind_tcp, run_tcp_until};
+use realm_core::udp::{bind_udp, run_udp_until};
 
 use crate::conf::{EndpointConf, EndpointInfo};
 
@@ -52,24 +51,33 @@ impl Listener {
 
 struct Relay {
     conf: EndpointConf,
-    endpoint: watch::Sender<Arc<Endpoint>>,
+    endpoint: Endpoint,
+    shutdown: oneshot::Sender<()>,
     task: JoinHandle<Result<()>>,
 }
 
 impl Relay {
-    fn spawn(lis: Listener, conf: EndpointConf, endpoint: Arc<Endpoint>) -> Self {
-        let (endpoint, rx) = watch::channel(endpoint);
-        let task = match lis {
-            Listener::Tcp(lis) => tokio::spawn(run_tcp_with(lis, rx)),
-            Listener::Udp(lis) => tokio::spawn(run_udp_with(lis, rx)),
+    fn spawn(lis: Listener, conf: EndpointConf, endpoint: Endpoint) -> Self {
+        let (shutdown, rx) = oneshot::channel();
+        let rx = async move {
+            let _ = rx.await;
         };
-        Relay { conf, endpoint, task }
+        let task = match lis {
+            Listener::Tcp(lis) => tokio::spawn(run_tcp_until(lis, endpoint.clone(), rx)),
+            Listener::Udp(lis) => tokio::spawn(run_udp_until(lis, endpoint.clone(), rx)),
+        };
+        Relay {
+            conf,
+            endpoint,
+            shutdown,
+            task,
+        }
     }
 
     // wait until the listener is released
     async fn stop(self) {
-        let Relay { endpoint, task, .. } = self;
-        drop(endpoint);
+        let Relay { shutdown, task, .. } = self;
+        drop(shutdown);
         // the handle of a finished task may have been polled to completion by `Relays::join`
         if !task.is_finished() {
             let _ = task.await;
@@ -91,7 +99,7 @@ pub fn report(level: Level, msg: std::fmt::Arguments) {
     };
 }
 
-type Wanted = HashMap<Key, (EndpointConf, Arc<Endpoint>)>;
+type Wanted = HashMap<Key, (EndpointConf, Endpoint)>;
 
 fn wanted(endpoints: Vec<(EndpointConf, EndpointInfo)>) -> std::result::Result<Wanted, String> {
     let mut wanted = HashMap::new();
@@ -101,7 +109,6 @@ fn wanted(endpoints: Vec<(EndpointConf, EndpointInfo)>) -> std::result::Result<W
             use_udp,
             endpoint,
         } = info;
-        let endpoint = Arc::new(endpoint);
         let protos = [(!no_tcp, Proto::Tcp), (use_udp, Proto::Udp)];
         for (_, proto) in protos.into_iter().filter(|(on, _)| *on) {
             let key = (endpoint.laddr, proto);
@@ -134,73 +141,77 @@ impl Relays {
     /// Apply endpoints. If they are invalid or a new listener fails to bind, nothing is changed.
     ///
     /// - removed endpoints are stopped, established tcp connections are kept.
-    /// - endpoints with changed bind options are stopped and started again,
-    ///   if that fails, the old one is restored.
-    /// - endpoints with other changes are updated in place, without rebinding.
+    /// - changed endpoints are stopped and started again, if that fails, the old one is restored.
     /// - new endpoints, and those exited, are started.
     pub async fn apply(&mut self, endpoints: Vec<(EndpointConf, EndpointInfo)>) -> std::result::Result<(), String> {
         let wanted = wanted(endpoints)?;
+        let running: HashSet<Key> = self
+            .0
+            .iter()
+            .filter(|(_, relay)| !relay.task.is_finished())
+            .map(|(key, _)| *key)
+            .collect();
 
         // bind new listeners before anything is changed
         let mut fresh = HashMap::new();
         for (key, (_, endpoint)) in wanted.iter() {
-            if !self.0.get(key).is_some_and(|relay| !relay.task.is_finished()) {
+            if !running.contains(key) {
                 fresh.insert(*key, Listener::bind(key.1, endpoint)?);
             }
         }
 
-        // stop relays that are removed or have exited
+        // stop relays that are removed, changed or have exited
         let stale: Vec<Key> = self
             .0
             .iter()
-            .filter(|(key, relay)| !wanted.contains_key(key) || relay.task.is_finished())
+            .filter(|(key, relay)| {
+                !running.contains(key) || wanted.get(key).is_none_or(|(conf, _)| *conf != relay.conf)
+            })
             .map(|(key, _)| *key)
             .collect();
+        let mut changed = HashMap::new();
         for key in stale {
-            self.0.remove(&key).unwrap().stop().await;
-            if !wanted.contains_key(&key) {
+            let relay = self.0.remove(&key).unwrap();
+            let old = (relay.conf.clone(), relay.endpoint.clone());
+            relay.stop().await;
+            if running.contains(&key) {
                 report(Level::Info, format_args!("stopped: [{}]{}", key.1, key.0));
+                if wanted.contains_key(&key) {
+                    changed.insert(key, old);
+                }
             }
         }
 
+        // start new and changed relays
         for (key, (conf, endpoint)) in wanted {
-            let proto = key.1;
-            if let Some(lis) = fresh.remove(&key) {
-                report(Level::Info, format_args!("started: [{}]{}", proto, endpoint));
-                self.0.insert(key, Relay::spawn(lis, conf, endpoint));
+            if self.0.contains_key(&key) {
                 continue;
             }
-
-            let relay = self.0.get_mut(&key).unwrap();
-            if relay.conf == conf {
-                continue;
-            }
-            if relay.endpoint.borrow().bind_opts == endpoint.bind_opts {
-                report(Level::Info, format_args!("updated: [{}]{}", proto, endpoint));
-                relay.conf = conf;
-                relay.endpoint.send_replace(endpoint);
-                continue;
-            }
-
-            // rebind, the old listener must be closed first
-            let old = self.0.remove(&key).unwrap();
-            let (old_conf, old_endpoint) = (old.conf.clone(), old.endpoint.borrow().clone());
-            old.stop().await;
-            report(Level::Info, format_args!("stopped: [{}]{}", proto, key.0));
-            let (conf, endpoint, lis) = match Listener::bind(proto, &endpoint) {
+            // a changed relay is bound now, after the old listener is closed
+            let bound = match fresh.remove(&key) {
+                Some(lis) => Ok(lis),
+                None => Listener::bind(key.1, &endpoint),
+            };
+            let (conf, endpoint, lis) = match bound {
                 Ok(lis) => (conf, endpoint, lis),
-                Err(e) => {
-                    report(Level::Error, format_args!("{}, restore the old one", e));
-                    match Listener::bind(proto, &old_endpoint) {
-                        Ok(lis) => (old_conf, old_endpoint, lis),
-                        Err(e) => {
-                            report(Level::Error, format_args!("{}", e));
-                            continue;
+                Err(e) => match changed.remove(&key) {
+                    Some((conf, endpoint)) => {
+                        report(Level::Error, format_args!("{}, restore the old one", e));
+                        match Listener::bind(key.1, &endpoint) {
+                            Ok(lis) => (conf, endpoint, lis),
+                            Err(e) => {
+                                report(Level::Error, format_args!("{}", e));
+                                continue;
+                            }
                         }
                     }
-                }
+                    None => {
+                        report(Level::Error, format_args!("{}", e));
+                        continue;
+                    }
+                },
             };
-            report(Level::Info, format_args!("started: [{}]{}", proto, endpoint));
+            report(Level::Info, format_args!("started: [{}]{}", key.1, endpoint));
             self.0.insert(key, Relay::spawn(lis, conf, endpoint));
         }
 
@@ -247,7 +258,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_rebind_and_stop() {
+    async fn change_and_stop() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
         let laddr = "127.0.0.1:17000";
         let r0 = TcpListener::bind("127.0.0.1:27000").await.unwrap();
         let r1 = TcpListener::bind("127.0.0.1:27001").await.unwrap();
@@ -262,38 +275,36 @@ mod tests {
 
         relays.apply(endpoints(&conf("127.0.0.1:27000", ""))).await.unwrap();
         let id = task_id(&relays, laddr, Proto::Tcp).unwrap();
-        assert_eq!(route(laddr, &[&r0, &r1]).await, 0);
+        let mut local = TcpStream::connect(laddr).await.unwrap();
+        let (mut peer, _) = r0.accept().await.unwrap();
 
         // same config, nothing changes
         relays.apply(endpoints(&conf("127.0.0.1:27000", ""))).await.unwrap();
         assert_eq!(task_id(&relays, laddr, Proto::Tcp), Some(id));
 
-        // remote changes, updated in place
+        // remote changes, restarted
         relays.apply(endpoints(&conf("127.0.0.1:27001", ""))).await.unwrap();
-        assert_eq!(task_id(&relays, laddr, Proto::Tcp), Some(id));
-        assert_eq!(route(laddr, &[&r0, &r1]).await, 1);
-
-        // bind options change, rebind
-        let ipv6_only = "network = { ipv6_only = true }";
-        relays
-            .apply(endpoints(&conf("127.0.0.1:27001", ipv6_only)))
-            .await
-            .unwrap();
         let id2 = task_id(&relays, laddr, Proto::Tcp).unwrap();
         assert_ne!(id2, id);
         assert_eq!(route(laddr, &[&r0, &r1]).await, 1);
 
-        // udp enabled, tcp kept
-        let udp = "network = { ipv6_only = true, use_udp = true }";
+        // udp enabled, the endpoint changes
+        let udp = "network = { use_udp = true }";
         relays.apply(endpoints(&conf("127.0.0.1:27001", udp))).await.unwrap();
         assert!(task_id(&relays, laddr, Proto::Udp).is_some());
-        assert_eq!(task_id(&relays, laddr, Proto::Tcp), Some(id2));
+        assert_ne!(task_id(&relays, laddr, Proto::Tcp), Some(id2));
 
-        // removed, port released
+        // removed, ports released
         relays.apply(Vec::new()).await.unwrap();
         assert!(relays.0.is_empty());
         TcpListener::bind(laddr).await.unwrap();
         tokio::net::UdpSocket::bind(laddr).await.unwrap();
+
+        // the connection established at first is still alive
+        let mut buf = [0u8; 4];
+        local.write_all(b"ping").await.unwrap();
+        peer.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
     }
 
     #[tokio::test]

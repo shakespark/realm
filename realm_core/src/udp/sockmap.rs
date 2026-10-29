@@ -4,12 +4,7 @@ use std::collections::HashMap;
 
 use tokio::net::UdpSocket;
 
-use crate::endpoint::Endpoint;
-
-/// Associations, client address => (socket, endpoint when it is established).
-pub struct SockMap(RwLock<HashMap<SocketAddr, Association>>);
-
-type Association = (Arc<UdpSocket>, Arc<Endpoint>);
+pub struct SockMap(RwLock<HashMap<SocketAddr, Arc<UdpSocket>>>);
 
 impl SockMap {
     pub fn new() -> Self {
@@ -17,7 +12,7 @@ impl SockMap {
     }
 
     #[inline]
-    pub fn find(&self, addr: &SocketAddr) -> Option<Association> {
+    pub fn find(&self, addr: &SocketAddr) -> Option<Arc<UdpSocket>> {
         // fetch the lock
 
         let sockmap = self.0.read().unwrap();
@@ -28,26 +23,26 @@ impl SockMap {
     }
 
     #[inline]
-    pub fn insert(&self, addr: SocketAddr, association: Association) {
+    pub fn insert(&self, addr: SocketAddr, socket: Arc<UdpSocket>) {
         // fetch the lock
         let mut sockmap = self.0.write().unwrap();
 
-        let _ = sockmap.insert(addr, association);
+        let _ = sockmap.insert(addr, socket);
 
         // drop the lock
     }
 
     #[inline]
-    pub fn find_or_insert<E, F>(&self, addr: &SocketAddr, f: F) -> Result<Association, E>
+    pub fn find_or_insert<E, F>(&self, addr: &SocketAddr, f: F) -> Result<Arc<UdpSocket>, E>
     where
-        F: FnOnce() -> Result<Association, E>,
+        F: FnOnce() -> Result<Arc<UdpSocket>, E>,
     {
         match self.find(addr) {
             Some(x) => Ok(x),
             None => {
-                let association = f()?;
-                self.insert(*addr, association.clone());
-                Ok(association)
+                let socket = f()?;
+                self.insert(*addr, Arc::clone(&socket));
+                Ok(socket)
             }
         }
     }

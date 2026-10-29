@@ -205,10 +205,10 @@ realm -c config.toml --reload
 kill -HUP $(pidof realm)
 ```
 
-- New endpoints are started, removed endpoints are stopped. Established tcp connections are kept, udp associations are closed.
-- Changes of an endpoint apply to new connections, established tcp connections and udp associations keep the old config. The listener is reused, unless `listen_interface`, `ipv6_only` or `accept_mptcp` changes.
+- Endpoints are identified by listen address. New endpoints are started, removed endpoints are stopped, changed endpoints are stopped and started again with the new config.
+- Stopping an endpoint closes its listener and udp associations, established tcp connections are kept.
 - `log.level` is applied, `log.output` and `dns` need a restart.
-- If the config is invalid or a new listener fails to bind, nothing is changed and an error is reported. If rebinding a listener fails, the endpoint keeps its old config.
+- If the config is invalid or a new listener fails to bind, nothing is changed and an error is reported. If a changed endpoint fails to start, the old one is restored.
 - Like without `--reload`, realm exits when all endpoints exit.
 
 Start with environment variables:
