@@ -45,7 +45,7 @@ pub trait Config {
     fn from_cmd_args(matches: &ArgMatches) -> Self;
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct CmdOverride {
     pub log: LogConf,
     pub dns: DnsConf,

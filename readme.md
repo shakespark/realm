@@ -132,6 +132,7 @@ FLAGS:
   -6, --ipv6     force disable ipv6 mapped ipv4
   -f, --tfo      force enable tcp fast open -- deprecated
   -z, --splice   force enable tcp zero copy -- deprecated
+      --reload   reload config file on SIGHUP
 
 OPTIONS:
   -c, --config <path>               use config file
@@ -193,6 +194,23 @@ realm -c config.json
 # hidden ones are recursively excluded (e.g.: config/.hidden_file, config/.hidden_dir/)
 realm -c config/
 ```
+
+Reload config file without restart (unix only):
+
+```shell
+# enable reload on SIGHUP
+realm -c config.toml --reload
+
+# reload
+kill -HUP $(pidof realm)
+```
+
+- Endpoints are identified by listen address. New endpoints are started, removed endpoints are stopped, changed endpoints are stopped and started again with the new config.
+- Stopping an endpoint closes its listener and udp associations, established tcp connections are kept.
+- `log.level` is applied, `log.output` and `dns` need a restart.
+- If the config is invalid or a new listener fails to bind, nothing is changed and an error is reported. If a changed endpoint fails to start, the old one is restored.
+- Like without `--reload`, realm exits when all endpoints exit, with exit code 1.
+- `--reload` only works with `-c`, not with `REALM_CONF`.
 
 Start with environment variables:
 

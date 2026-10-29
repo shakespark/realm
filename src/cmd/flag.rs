@@ -64,6 +64,11 @@ pub fn add_flags(app: Command) -> Command {
             .help("force enable tcp zero copy -- deprecated")
             .action(ArgAction::SetTrue)
             .display_order(8),
+        Arg::new("reload")
+            .long("reload")
+            .help("reload config file on SIGHUP")
+            .action(ArgAction::SetTrue)
+            .display_order(9),
     ])
 }
 

@@ -5,9 +5,14 @@ mod sockmap;
 mod middle;
 mod batched;
 
+use std::future::{Future, pending};
 use std::io::Result;
+use std::pin::pin;
+use std::sync::Arc;
 
-use crate::trick::Ref;
+use tokio::net::UdpSocket;
+use tokio::task::JoinSet;
+
 use crate::endpoint::Endpoint;
 
 use sockmap::SockMap;
@@ -15,25 +20,38 @@ use middle::associate_and_relay;
 
 /// Launch a udp relay.
 pub async fn run_udp(endpoint: Endpoint) -> Result<()> {
-    let Endpoint {
-        laddr,
-        raddr,
-        bind_opts,
-        conn_opts,
-        ..
-    } = endpoint;
+    let lis = bind_udp(&endpoint).unwrap_or_else(|e| panic!("[udp]failed to bind {}: {}", endpoint.laddr, e));
+    run_udp_until(lis, endpoint, pending()).await
+}
 
-    let sockmap = SockMap::new();
+/// Bind a udp socket on the local address of an endpoint.
+pub fn bind_udp(endpoint: &Endpoint) -> Result<UdpSocket> {
+    socket::bind(&endpoint.laddr, endpoint.bind_opts.clone())
+}
 
-    let lis = socket::bind(&laddr, bind_opts).unwrap_or_else(|e| panic!("[udp]failed to bind {}: {}", laddr, e));
+/// Launch a udp relay on a bound socket, until `shutdown` completes.
+///
+/// All associations are closed and the socket is released on return.
+pub async fn run_udp_until(lis: UdpSocket, endpoint: Endpoint, shutdown: impl Future<Output = ()>) -> Result<()> {
+    let Endpoint { raddr, conn_opts, .. } = endpoint;
 
-    let lis = Ref::new(&lis);
-    let raddr = Ref::new(&raddr);
-    let conn_opts = Ref::new(&conn_opts);
-    let sockmap = Ref::new(&sockmap);
+    let lis = Arc::new(lis);
+    let sockmap = Arc::new(SockMap::new());
+    let mut associations = JoinSet::new();
+    let mut shutdown = pin!(shutdown);
+
     loop {
-        if let Err(e) = associate_and_relay(lis, raddr, conn_opts, sockmap).await {
-            log::error!("[udp]error: {}", e);
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => break,
+            res = associate_and_relay(&lis, &raddr, &conn_opts, &sockmap, &mut associations) => {
+                if let Err(e) = res {
+                    log::error!("[udp]error: {}", e);
+                }
+            }
         }
     }
+
+    associations.shutdown().await;
+    Ok(())
 }
