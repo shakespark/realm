@@ -6,6 +6,7 @@ mod middle;
 mod batched;
 
 use std::io::Result;
+use std::pin::pin;
 use std::sync::Arc;
 
 use tokio::net::UdpSocket;
@@ -37,15 +38,23 @@ pub fn bind_udp(endpoint: &Endpoint) -> Result<UdpSocket> {
 /// Local address and bind options of an updated endpoint are ignored.
 ///
 /// The relay stops once the sender is dropped, all associations are closed as well.
-pub async fn run_udp_with(lis: UdpSocket, mut endpoint: watch::Receiver<Arc<Endpoint>>) -> Result<()> {
+pub async fn run_udp_with(lis: UdpSocket, endpoint: watch::Receiver<Arc<Endpoint>>) -> Result<()> {
     let lis = Arc::new(lis);
     let sockmap = Arc::new(SockMap::new());
     let mut associations = JoinSet::new();
 
+    let mut stop = endpoint.clone();
+    let mut stopped = pin!(async move { while stop.changed().await.is_ok() {} });
+
     loop {
-        match associate_and_relay(&lis, &mut endpoint, &sockmap, &mut associations).await {
-            Ok(()) => break,
-            Err(e) => log::error!("[udp]error: {}", e),
+        tokio::select! {
+            biased;
+            _ = &mut stopped => break,
+            res = associate_and_relay(&lis, &endpoint, &sockmap, &mut associations) => {
+                if let Err(e) = res {
+                    log::error!("[udp]error: {}", e);
+                }
+            }
         }
     }
 
